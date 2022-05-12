@@ -27,6 +27,8 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 
 use async_trait::async_trait;
 use timely::progress::frontier::MutableAntichain;
@@ -69,15 +71,19 @@ where
         self.absorb_command(cmd).await
     }
 
-    async fn recv(&mut self) -> Result<Option<ComputeResponse<T>>, anyhow::Error> {
+    async fn recv(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<ComputeResponse<T>>, anyhow::Error>> + Send>>
+    {
         if let Some(response) = self.responses.pop_front() {
-            Ok(Some(response))
+            Box::pin(async move { Ok(Some(response)) })
         } else {
-            let response = self.client.recv().await;
+            let response = self.client.recv().await.await;
             if let Ok(Some(response)) = response {
-                self.absorb_response(response)
+                self.absorb_response(response);
             }
-            Ok(self.responses.pop_front())
+            let response = self.responses.pop_front();
+            Box::pin(async { Ok(response) })
         }
     }
 }

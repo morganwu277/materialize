@@ -15,6 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::future::Future;
 use std::pin::Pin;
 
 use async_trait::async_trait;
@@ -439,6 +440,8 @@ pub struct TimestampBindingFeedback<T = mz_repr::Timestamp> {
 /// Responses that the controller can provide back to the coordinator.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ControllerResponse<T = mz_repr::Timestamp> {
+    /// Make another call to recv.
+    RecvAgain,
     /// The worker's response to a specified (by connection id) peek.
     PeekResponse(Uuid, PeekResponse),
     /// The worker's next response to a specified tail.
@@ -484,7 +487,9 @@ pub trait GenericClient<C, R>: fmt::Debug + Send {
     ///
     /// This method blocks until the next response is available, or, if the
     /// dataflow server has been shut down, returns `None`.
-    async fn recv(&mut self) -> Result<Option<R>, anyhow::Error>;
+    async fn recv(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<R>, anyhow::Error>> + Send>>;
 
     /// Returns an adapter that treats the client as a stream.
     ///
@@ -492,17 +497,13 @@ pub trait GenericClient<C, R>: fmt::Debug + Send {
     /// calls to `recv`.
     fn as_stream<'a>(
         &'a mut self,
-    ) -> Pin<Box<dyn Stream<Item = Result<R, anyhow::Error>> + Send + 'a>>
+    ) -> Pin<Box<dyn Stream<Item = Pin<Box<dyn Future<Output = Result<Option<R>, anyhow::Error>> + Send>>> + Send + 'a>>
     where
         R: Send + 'a,
     {
         Box::pin(async_stream::stream! {
             loop {
-                match self.recv().await {
-                    Ok(Some(response)) => yield Ok(response),
-                    Err(error) => yield Err(error),
-                    Ok(None) => { return; }
-                }
+                yield self.recv().await;
             }
         })
     }
@@ -532,7 +533,9 @@ where
     async fn send(&mut self, cmd: C) -> Result<(), anyhow::Error> {
         (**self).send(cmd).await
     }
-    async fn recv(&mut self) -> Result<Option<R>, anyhow::Error> {
+    async fn recv(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<R>, anyhow::Error>> + Send>> {
         (**self).recv().await
     }
 }
@@ -542,7 +545,10 @@ impl<T: Send> GenericClient<ComputeCommand<T>, ComputeResponse<T>> for Box<dyn C
     async fn send(&mut self, cmd: ComputeCommand<T>) -> Result<(), anyhow::Error> {
         (**self).send(cmd).await
     }
-    async fn recv(&mut self) -> Result<Option<ComputeResponse<T>>, anyhow::Error> {
+    async fn recv(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<ComputeResponse<T>>, anyhow::Error>> + Send>>
+    {
         (**self).recv().await
     }
 }
@@ -552,7 +558,10 @@ impl<T: Send> GenericClient<StorageCommand<T>, StorageResponse<T>> for Box<dyn S
     async fn send(&mut self, cmd: StorageCommand<T>) -> Result<(), anyhow::Error> {
         (**self).send(cmd).await
     }
-    async fn recv(&mut self) -> Result<Option<StorageResponse<T>>, anyhow::Error> {
+    async fn recv(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<StorageResponse<T>>, anyhow::Error>> + Send>>
+    {
         (**self).recv().await
     }
 }
@@ -597,16 +606,18 @@ impl<C, R> GenericClient<C, R> for LocalClient<C, R>
 where
     (C, R): partitioned::Partitionable<C, R>,
     C: fmt::Debug + Send,
-    R: fmt::Debug + Send,
+    R: fmt::Debug + Send + 'static,
 {
     async fn send(&mut self, cmd: C) -> Result<(), anyhow::Error> {
         trace!("SEND dataflow command: {:?}", cmd);
         self.client.send(cmd).await
     }
-    async fn recv(&mut self) -> Result<Option<R>, anyhow::Error> {
-        let response = self.client.recv().await;
+    async fn recv(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<R>, anyhow::Error>> + Send>> {
+        let response = self.client.recv().await.await;
         trace!("RECV dataflow response: {:?}", response);
-        response
+        Box::pin(async move { response })
     }
 }
 
@@ -658,22 +669,26 @@ impl<C, R> GenericClient<C, R> for RemoteClient<C, R>
 where
     (C, R): partitioned::Partitionable<C, R>,
     C: Serialize + fmt::Debug + Unpin + Send,
-    R: DeserializeOwned + fmt::Debug + Unpin + Send,
+    R: DeserializeOwned + fmt::Debug + Unpin + Send + 'static,
 {
     async fn send(&mut self, cmd: C) -> Result<(), anyhow::Error> {
         trace!("Sending dataflow command: {:?}", cmd);
         self.client.send(cmd).await
     }
-    async fn recv(&mut self) -> Result<Option<R>, anyhow::Error> {
-        let response = self.client.recv().await;
+    async fn recv(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<R>, anyhow::Error>> + Send>> {
+        let response = self.client.recv().await.await;
         trace!("Receiving dataflow response: {:?}", response);
-        response
+        Box::pin(async move { response })
     }
 }
 
 /// A client backed by a process-local timely worker thread.
 pub mod process_local {
     use std::fmt;
+    use std::future::Future;
+    use std::pin::Pin;
 
     use async_trait::async_trait;
 
@@ -691,7 +706,7 @@ pub mod process_local {
     impl<C, R> GenericClient<C, R> for ProcessLocal<C, R>
     where
         C: fmt::Debug + Send,
-        R: fmt::Debug + Send,
+        R: fmt::Debug + Send + 'static,
     {
         async fn send(&mut self, cmd: C) -> Result<(), anyhow::Error> {
             self.worker_tx
@@ -701,8 +716,11 @@ pub mod process_local {
             Ok(())
         }
 
-        async fn recv(&mut self) -> Result<Option<R>, anyhow::Error> {
-            Ok(self.feedback_rx.recv().await)
+        async fn recv(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<R>, anyhow::Error>> + Send>> {
+            let res = self.feedback_rx.recv().await;
+            Box::pin(async move { Ok(res) })
         }
     }
 
@@ -840,7 +858,7 @@ pub mod tcp {
     impl<C, R> GenericClient<C, R> for TcpClient<C, R>
     where
         C: Serialize + fmt::Debug + Send + Unpin,
-        R: DeserializeOwned + fmt::Debug + Send + Unpin,
+        R: DeserializeOwned + fmt::Debug + Send + Unpin + 'static,
     {
         async fn send(&mut self, cmd: C) -> Result<(), anyhow::Error> {
             if let TcpConn::Connected(connection) = &mut self.connection {
@@ -854,10 +872,12 @@ pub mod tcp {
             }
         }
 
-        async fn recv(&mut self) -> Result<Option<R>, anyhow::Error> {
+        async fn recv(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<R>, anyhow::Error>> + Send>> {
             if let TcpConn::Connected(connection) = &mut self.connection {
                 match connection.next().await {
-                    Some(Ok(response)) => Ok(Some(response)),
+                    Some(Ok(response)) => Box::pin(async move { Ok(Some(response)) }),
                     other => {
                         match other {
                             Some(Ok(_)) => unreachable!("handled above"),
@@ -866,12 +886,14 @@ pub mod tcp {
                         }
                         self.connection = TcpConn::Disconnected;
                         self.connect().await;
-                        Err(anyhow::anyhow!("Connection severed; reconnected"))
+                        Box::pin(
+                            async move { Err(anyhow::anyhow!("Connection severed; reconnected")) },
+                        )
                     }
                 }
             } else {
                 self.connect().await;
-                Err(anyhow::anyhow!("Connection severed; reconnected"))
+                Box::pin(async move { Err(anyhow::anyhow!("Connection severed; reconnected")) })
             }
         }
     }

@@ -23,7 +23,9 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::fmt::Debug;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -141,7 +143,14 @@ pub trait StorageController: Debug + Send {
         source_ids: Vec<GlobalId>,
     ) -> Result<(), anyhow::Error>;
 
-    async fn recv(&mut self) -> Result<Option<StorageResponse<Self::Timestamp>>, anyhow::Error>;
+    async fn recv(
+        &mut self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<StorageResponse<Self::Timestamp>>, anyhow::Error>>
+                + Send,
+        >,
+    >;
 }
 
 /// Metadata required by a storage instance to read a storage collection
@@ -678,7 +687,14 @@ where
         Ok(())
     }
 
-    async fn recv(&mut self) -> Result<Option<StorageResponse<Self::Timestamp>>, anyhow::Error> {
+    async fn recv(
+        &mut self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<StorageResponse<Self::Timestamp>>, anyhow::Error>>
+                + Send,
+        >,
+    > {
         self.state.client.recv().await
     }
 

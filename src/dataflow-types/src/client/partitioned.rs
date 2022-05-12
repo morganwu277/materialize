@@ -12,7 +12,9 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
 use std::iter;
+use std::pin::Pin;
 
 use async_trait::async_trait;
 use differential_dataflow::Hashable;
@@ -69,7 +71,7 @@ where
     P: GenericClient<C, R>,
     (C, R): Partitionable<C, R>,
     C: fmt::Debug + Send,
-    R: fmt::Debug + Send,
+    R: fmt::Debug + Send + 'static,
 {
     async fn send(&mut self, cmd: C) -> Result<(), anyhow::Error> {
         let cmd_parts = self.state.split_command(cmd);
@@ -79,7 +81,9 @@ where
         Ok(())
     }
 
-    async fn recv(&mut self) -> Result<Option<R>, anyhow::Error> {
+    async fn recv(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<R>, anyhow::Error>> + Send>> {
         let parts = self.parts.len();
         let mut stream: StreamMap<_, _> = self
             .parts
@@ -88,25 +92,26 @@ where
             .enumerate()
             .collect();
         while let Some((index, response)) = stream.next().await {
-            match response {
+            match response.await {
                 Err(e) => {
                     // Only emit one out of every `parts` errors. (If one
                     // underlying client observes an error, we expect all of
                     // the other clients to observe the same error.)
                     self.seen_errors += 1;
                     if (self.seen_errors % parts) == 0 {
-                        return Err(e);
+                        return Box::pin(async move { Err(e) });
                     }
                 }
-                Ok(response) => {
+                Ok(Some(response)) => {
                     if let Some(response) = self.state.absorb_response(index, response) {
-                        return response.map(Some);
+                        return Box::pin(async move { response.map(Some) });
                     }
                 }
+                Ok(None) => return Box::pin(async { Ok(None) }),
             }
         }
         // Indicate completion of the communication.
-        Ok(None)
+        Box::pin(async { Ok(None) })
     }
 }
 

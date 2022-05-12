@@ -743,7 +743,7 @@ impl<S: Append + 'static> Coordinator<S> {
 
                 Some(m) = internal_cmd_rx.recv() => m,
                 m = self.dataflow_client.recv() => {
-                    match m.unwrap() {
+                    match m.await.unwrap() {
                         None => break,
                         Some(r) => Message::Controller(r),
                     }
@@ -808,6 +808,7 @@ impl<S: Append + 'static> Coordinator<S> {
 
     async fn message_controller(&mut self, message: ControllerResponse) {
         match message {
+            ControllerResponse::RecvAgain => (),
             ControllerResponse::PeekResponse(uuid, response) => {
                 // We expect exactly one peek response, which we forward. Then we clean up the
                 // peek's state in the coordinator.

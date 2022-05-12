@@ -314,7 +314,7 @@ where
                     Some(cmd) => { client.send(cmd).await.unwrap(); },
                 },
                 res = client.recv() => {
-                    match res.unwrap() {
+                    match res.await.unwrap() {
                         None => break,
                         Some(response) => { conn.send(response).await?; }
                     }

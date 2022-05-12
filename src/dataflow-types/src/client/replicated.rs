@@ -23,6 +23,8 @@
 //! exist any longer.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 
 use timely::progress::{frontier::MutableAntichain, Antichain};
 
@@ -184,7 +186,10 @@ where
         Ok(())
     }
 
-    async fn recv(&mut self) -> Result<Option<ComputeResponse<T>>, anyhow::Error> {
+    async fn recv(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<ComputeResponse<T>>, anyhow::Error>> + Send>>
+    {
         if self.replicas.is_empty() {
             // We want to communicate that the result is not ready
             futures::future::pending().await
@@ -203,16 +208,18 @@ where
 
                 use futures::StreamExt;
                 while let Some((replica_id, message)) = stream.next().await {
-                    match message {
-                        Ok(ComputeResponse::PeekResponse(uuid, response)) => {
+                    match message.await {
+                        Ok(Some(ComputeResponse::PeekResponse(uuid, response))) => {
                             // If this is the first response, forward it; otherwise do not.
                             // TODO: we could collect the other responses to assert equivalence?
                             // Trades resources (memory) for reassurances; idk which is best.
                             if self.peeks.remove(&uuid) {
-                                return Ok(Some(ComputeResponse::PeekResponse(uuid, response)));
+                                return Box::pin(async move {
+                                    Ok(Some(ComputeResponse::PeekResponse(uuid, response)))
+                                });
                             }
                         }
-                        Ok(ComputeResponse::FrontierUppers(mut list)) => {
+                        Ok(Some(ComputeResponse::FrontierUppers(mut list))) => {
                             for (id, changes) in list.iter_mut() {
                                 if let Some((frontier, frontiers)) = self.uppers.get_mut(id) {
                                     // Apply changes to replica `replica_id`
@@ -234,10 +241,12 @@ where
                                 }
                             }
                             if !list.is_empty() {
-                                return Ok(Some(ComputeResponse::FrontierUppers(list)));
+                                return Box::pin(async move {
+                                    Ok(Some(ComputeResponse::FrontierUppers(list)))
+                                });
                             }
                         }
-                        Ok(ComputeResponse::TailResponse(id, response)) => {
+                        Ok(Some(ComputeResponse::TailResponse(id, response))) => {
                             use crate::{TailBatch, TailResponse};
                             match response {
                                 TailResponse::Batch(TailBatch {
@@ -266,14 +275,16 @@ where
                                         updates.retain(|(time, _data, _diff)| {
                                             new_lower.less_equal(time)
                                         });
-                                        return Ok(Some(ComputeResponse::TailResponse(
-                                            id,
-                                            TailResponse::Batch(TailBatch {
-                                                lower: new_lower,
-                                                upper: new_upper,
-                                                updates,
-                                            }),
-                                        )));
+                                        return Box::pin(async move {
+                                            Ok(Some(ComputeResponse::TailResponse(
+                                                id,
+                                                TailResponse::Batch(TailBatch {
+                                                    lower: new_lower,
+                                                    upper: new_upper,
+                                                    updates,
+                                                }),
+                                            )))
+                                        });
                                     }
                                 }
                                 TailResponse::DroppedAt(frontier) => {
@@ -282,13 +293,16 @@ where
                                     // to observed responses; if we pre-load the entries in response to commands we can
                                     // clean up the state here.
                                     self.tails.insert(id, Antichain::new());
-                                    return Ok(Some(ComputeResponse::TailResponse(
-                                        id,
-                                        TailResponse::DroppedAt(frontier),
-                                    )));
+                                    return Box::pin(async move {
+                                        Ok(Some(ComputeResponse::TailResponse(
+                                            id,
+                                            TailResponse::DroppedAt(frontier),
+                                        )))
+                                    });
                                 }
                             }
                         }
+                        Ok(None) => return Box::pin(async { Ok(None) }),
                         Err(_error) => {
                             errored_replica = Some(replica_id);
                             break;
@@ -305,7 +319,7 @@ where
                 clean_recv = errored_replica.is_none();
             }
             // Indicate completion of the communication.
-            Ok(None)
+            Box::pin(async { Ok(None) })
         }
     }
 }
