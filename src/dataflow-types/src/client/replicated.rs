@@ -25,8 +25,6 @@
 use std::collections::{HashMap, HashSet};
 
 use timely::progress::{frontier::MutableAntichain, Antichain};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::client::Peek;
 use mz_repr::GlobalId;
@@ -34,68 +32,11 @@ use mz_repr::GlobalId;
 use super::{ComputeClient, GenericClient};
 use super::{ComputeCommand, ComputeResponse};
 
-/// Spawns a task that repeatedly sends messages back and forth
-/// between a client and its owner, and return channels to communicate with it.
-///
-/// This can be useful because sending to an `mpsc` is synchronous, eliminating
-/// cancelation-unsafety in some cases.
-///
-/// For this to be useful, `Client::recv` must itself be cancelation-safe.
-pub fn spawn_client_task<
-    C: Send + 'static,
-    R: Send + 'static,
-    Client: GenericClient<C, R> + 'static,
-    Name: AsRef<str>,
-    NameClosure: FnOnce() -> Name,
->(
-    mut client: Client,
-    nc: NameClosure,
-) -> (
-    UnboundedSender<C>,
-    UnboundedReceiver<Result<R, anyhow::Error>>,
-) {
-    let (cmd_tx, mut cmd_rx) = unbounded_channel();
-    let (response_tx, response_rx) = unbounded_channel();
-    mz_ore::task::spawn(nc, async move {
-        loop {
-            tokio::select! {
-                m = cmd_rx.recv() => {
-                    match m {
-                        Some(c) => {
-                            // Issues should be detected, and
-                            // reconnect attempted, on the `client.recv` path.
-                            let _ = client.send(c).await;
-                        },
-                        None => break,
-                    }
-                },
-                m = client.recv() => {
-                    match m.transpose() {
-                        Some(m) => {
-                            if response_tx.send(m).is_err() {
-                                break;
-                            }
-                        }
-                        None => break,
-                    }
-                }
-            }
-        }
-    });
-    (cmd_tx, response_rx)
-}
-
 /// A client backed by multiple replicas.
 #[derive(Debug)]
-pub struct ActiveReplication<T> {
-    /// Handles to the replicas themselves.
-    replicas: HashMap<
-        String,
-        (
-            UnboundedSender<ComputeCommand<T>>,
-            UnboundedReceiverStream<Result<ComputeResponse<T>, anyhow::Error>>,
-        ),
-    >,
+pub struct ActiveReplication<C, T> {
+    /// The replicas themselves.
+    replicas: HashMap<String, C>,
     /// Outstanding peek identifiers, to guide responses (and which to suppress).
     peeks: HashSet<uuid::Uuid>,
     /// Reported frontier of each in-progress tail.
@@ -108,7 +49,7 @@ pub struct ActiveReplication<T> {
     last_command_count: usize,
 }
 
-impl<T> Default for ActiveReplication<T> {
+impl<C, T> Default for ActiveReplication<C, T> {
     fn default() -> Self {
         Self {
             replicas: Default::default(),
@@ -121,18 +62,14 @@ impl<T> Default for ActiveReplication<T> {
     }
 }
 
-impl<T> ActiveReplication<T>
+impl<C: ComputeClient<T>, T> ActiveReplication<C, T>
 where
     T: timely::progress::Timestamp,
 {
     /// Introduce a new replica, and catch it up to the commands of other replicas.
     ///
     /// It is not yet clear under which circumstances a replica can be removed.
-    pub async fn add_replica<C: ComputeClient<T> + 'static>(
-        &mut self,
-        identifier: String,
-        client: C,
-    ) {
+    pub async fn add_replica(&mut self, identifier: String, client: C) {
         for (_, frontiers) in self.uppers.values_mut() {
             frontiers.insert(identifier.clone(), {
                 let mut frontier = timely::progress::frontier::MutableAntichain::new();
@@ -140,11 +77,8 @@ where
                 frontier
             });
         }
-        let (cmd_tx, resp_rx) =
-            spawn_client_task(client, || "ActiveReplication client message pump");
-        self.replicas
-            .insert(identifier.clone(), (cmd_tx, resp_rx.into()));
-        self.hydrate_replica(&identifier);
+        self.replicas.insert(identifier.clone(), client);
+        self.hydrate_replica(&identifier).await;
     }
 
     pub fn get_replica_identifiers(&self) -> impl Iterator<Item = &String> {
@@ -160,7 +94,7 @@ where
     }
 
     /// Pipes a command stream at the indicated replica, introducing new dataflow identifiers.
-    fn hydrate_replica(&mut self, replica_id: &str) {
+    async fn hydrate_replica(&mut self, replica_id: &str) {
         // Zero out frontiers maintained by this replica.
         for (_id, (_, frontiers)) in self.uppers.iter_mut() {
             *frontiers.get_mut(replica_id).unwrap() =
@@ -174,7 +108,7 @@ where
         self.last_command_count = self.history.reduce(&self.peeks);
 
         // Replay the commands at the client, creating new dataflow identifiers.
-        let (cmd_tx, _) = self.replicas.get_mut(replica_id).unwrap();
+        let client = self.replicas.get_mut(replica_id).unwrap();
         for command in self.history.iter() {
             let mut command = command.clone();
             // Replace dataflow identifiers with new unique ids.
@@ -183,15 +117,15 @@ where
                     dataflow.id = uuid::Uuid::new_v4();
                 }
             }
-            cmd_tx
-                .send(command)
-                .expect("Channel to client has gone away!")
+            // Suppress errors, as we will observe them in `recv` and react there.
+            let _ = client.send(command).await;
         }
     }
 }
 
 #[async_trait::async_trait]
-impl<T> GenericClient<ComputeCommand<T>, ComputeResponse<T>> for ActiveReplication<T>
+impl<C: ComputeClient<T>, T> GenericClient<ComputeCommand<T>, ComputeResponse<T>>
+    for ActiveReplication<C, T>
 where
     T: timely::progress::Timestamp + differential_dataflow::lattice::Lattice + std::fmt::Debug,
 {
@@ -233,7 +167,7 @@ where
         }
 
         // Clone the command for each active replica.
-        for (_id, (tx, _)) in self.replicas.iter_mut() {
+        for (_id, replica) in self.replicas.iter_mut() {
             let mut command = cmd.clone();
             // Replace dataflow identifiers with new unique ids.
             if let ComputeCommand::CreateDataflows(dataflows) = &mut command {
@@ -244,7 +178,7 @@ where
 
             // Errors are suppressed by this client, which awaits a reconnection in `recv` and
             // will rehydrate the client when that happens.
-            let _ = tx.send(command);
+            let _ = replica.send(command).await;
         }
 
         Ok(())
@@ -264,7 +198,7 @@ where
                 let mut stream: tokio_stream::StreamMap<_, _> = self
                     .replicas
                     .iter_mut()
-                    .map(|(id, (_, rx))| (id.clone(), rx))
+                    .map(|(id, shard)| (id.clone(), shard.as_stream()))
                     .collect();
 
                 use futures::StreamExt;
@@ -365,7 +299,7 @@ where
 
                 if let Some(replica_id) = &errored_replica {
                     tracing::warn!("Rehydrating replica {:?}", replica_id);
-                    self.hydrate_replica(replica_id);
+                    self.hydrate_replica(replica_id).await;
                 }
 
                 clean_recv = errored_replica.is_none();
