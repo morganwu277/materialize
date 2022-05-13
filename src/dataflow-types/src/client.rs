@@ -19,7 +19,6 @@ use std::future::Future;
 use std::pin::Pin;
 
 use async_trait::async_trait;
-use futures::Stream;
 use mz_repr::proto::{ProtoRepr, TryFromProtoError, TryIntoIfSome};
 use proptest::prelude::*;
 use proptest_derive::Arbitrary;
@@ -603,9 +602,12 @@ where
         self.client.send(cmd).await
     }
     async fn recv(&mut self) -> Recv<R> {
-        let response = self.client.recv().await.await;
-        trace!("RECV dataflow response: {:?}", response);
-        Box::pin(async move { response })
+        let response = self.client.recv().await;
+        Box::pin(async move {
+            let response = response.await;
+            trace!("RECV dataflow response: {:?}", response);
+            response
+        })
     }
 }
 
@@ -664,9 +666,12 @@ where
         self.client.send(cmd).await
     }
     async fn recv(&mut self) -> Recv<R> {
-        let response = self.client.recv().await.await;
-        trace!("Receiving dataflow response: {:?}", response);
-        Box::pin(async move { response })
+        let response = self.client.recv().await;
+        Box::pin(async move {
+            let response = response.await;
+            trace!("Receiving dataflow response: {:?}", response);
+            response
+        })
     }
 }
 
@@ -701,11 +706,13 @@ pub mod process_local {
         }
 
         async fn recv(&mut self) -> Recv<R> {
-            let res = match self.feedback_rx.recv().await {
-                Some(res) => Response::Ready(res),
-                None => Response::Done,
-            };
-            Box::pin(async move { Ok(res) })
+            let res = self.feedback_rx.recv().await;
+            Box::pin(async move {
+                match res {
+                    Some(res) => Ok(Response::Ready(res)),
+                    None => Ok(Response::Done),
+                }
+            })
         }
     }
 

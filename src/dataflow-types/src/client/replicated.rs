@@ -23,8 +23,6 @@
 //! exist any longer.
 
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
-use std::pin::Pin;
 
 use futures::future::{self, FutureExt};
 use timely::progress::{frontier::MutableAntichain, Antichain};
@@ -198,8 +196,7 @@ where
                 .replicas
                 .iter_mut()
                 .map(|(id, shard)| shard.recv().map(move |res| (id, res)));
-            let ((replica_id, message), _, blah) = future::select_all(recvs).await;
-            drop(blah);
+            let ((replica_id, message), _, _) = future::select_all(recvs).await;
             match message.await {
                 Ok(Response::Ready(ComputeResponse::PeekResponse(uuid, response))) => {
                     // If this is the first response, forward it; otherwise do not.
