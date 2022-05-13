@@ -26,12 +26,13 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 
+use futures::future::{self, FutureExt};
 use timely::progress::{frontier::MutableAntichain, Antichain};
 
 use crate::client::Peek;
 use mz_repr::GlobalId;
 
-use super::{ComputeClient, GenericClient};
+use super::{ComputeClient, GenericClient, Recv, Response};
 use super::{ComputeCommand, ComputeResponse};
 
 /// A client backed by multiple replicas.
@@ -126,9 +127,9 @@ where
 }
 
 #[async_trait::async_trait]
-impl<C: ComputeClient<T>, T> GenericClient<ComputeCommand<T>, ComputeResponse<T>>
-    for ActiveReplication<C, T>
+impl<C, T> GenericClient<ComputeCommand<T>, ComputeResponse<T>> for ActiveReplication<C, T>
 where
+    C: ComputeClient<T> + 'static,
     T: timely::progress::Timestamp + differential_dataflow::lattice::Lattice + std::fmt::Debug,
 {
     async fn send(&mut self, cmd: ComputeCommand<T>) -> Result<(), anyhow::Error> {
@@ -186,140 +187,123 @@ where
         Ok(())
     }
 
-    async fn recv(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<ComputeResponse<T>>, anyhow::Error>> + Send>>
-    {
+    async fn recv(&mut self) -> Recv<ComputeResponse<T>> {
         if self.replicas.is_empty() {
-            // We want to communicate that the result is not ready
-            futures::future::pending().await
-        } else {
-            // We may need to iterate, if a replica needs rehydration.
-            let mut clean_recv = false;
-            while !clean_recv {
-                let mut errored_replica = None;
+            // We want to communicate that the result is not ready.
+            return futures::future::pending().await;
+        }
 
-                // Receive responses from any of the replicas, and take appropriate action.
-                let mut stream: tokio_stream::StreamMap<_, _> = self
-                    .replicas
-                    .iter_mut()
-                    .map(|(id, shard)| (id.clone(), shard.as_stream()))
-                    .collect();
+        loop {
+            let recvs = self
+                .replicas
+                .iter_mut()
+                .map(|(id, shard)| shard.recv().map(move |res| (id, res)));
+            let ((replica_id, message), _, blah) = future::select_all(recvs).await;
+            drop(blah);
+            match message.await {
+                Ok(Response::Ready(ComputeResponse::PeekResponse(uuid, response))) => {
+                    // If this is the first response, forward it; otherwise do not.
+                    // TODO: we could collect the other responses to assert equivalence?
+                    // Trades resources (memory) for reassurances; idk which is best.
+                    if self.peeks.remove(&uuid) {
+                        return Box::pin(async move {
+                            Ok(Response::Ready(ComputeResponse::PeekResponse(
+                                uuid, response,
+                            )))
+                        });
+                    }
+                }
+                Ok(Response::Ready(ComputeResponse::FrontierUppers(mut list))) => {
+                    for (id, changes) in list.iter_mut() {
+                        if let Some((frontier, frontiers)) = self.uppers.get_mut(id) {
+                            // Apply changes to replica `replica_id`
+                            frontiers
+                                .get_mut(replica_id)
+                                .unwrap()
+                                .update_iter(changes.drain());
+                            // We can swap `frontier` into `changes, negated, and then use that to repopulate `frontier`.
+                            // Working
+                            changes.extend(frontier.iter().map(|t| (t.clone(), -1)));
+                            frontier.clear();
+                            for (time1, _neg_one) in changes.iter() {
+                                for time2 in frontiers[replica_id].frontier().iter() {
+                                    frontier.insert(time1.join(time2));
+                                }
+                            }
+                            changes.extend(frontier.iter().map(|t| (t.clone(), 1)));
+                            changes.compact();
+                        }
+                    }
+                    if !list.is_empty() {
+                        return Box::pin(async move {
+                            Ok(Response::Ready(ComputeResponse::FrontierUppers(list)))
+                        });
+                    }
+                }
+                Ok(Response::Ready(ComputeResponse::TailResponse(id, response))) => {
+                    use crate::{TailBatch, TailResponse};
+                    match response {
+                        TailResponse::Batch(TailBatch {
+                            lower: _,
+                            upper,
+                            mut updates,
+                        }) => {
+                            // It is sufficient to compare `upper` against the last reported frontier for `id`,
+                            // and if `upper` is not less or equal to that frontier, some progress has happened.
+                            // If so, we retain only the updates greater or equal to that last reported frontier,
+                            // and announce a batch from that frontier to its join with `upper`.
 
-                use futures::StreamExt;
-                while let Some((replica_id, message)) = stream.next().await {
-                    match message.await {
-                        Ok(Some(ComputeResponse::PeekResponse(uuid, response))) => {
-                            // If this is the first response, forward it; otherwise do not.
-                            // TODO: we could collect the other responses to assert equivalence?
-                            // Trades resources (memory) for reassurances; idk which is best.
-                            if self.peeks.remove(&uuid) {
+                            // Ensure that we have a recorded frontier ready to go.
+                            let entry = self
+                                .tails
+                                .entry(id)
+                                .or_insert_with(|| Antichain::from_elem(T::minimum()));
+                            // If the upper frontier has changed, we have a statement to make.
+                            // This happens if there is any element of `entry` not greater or
+                            // equal to some element of `upper`.
+                            use differential_dataflow::lattice::Lattice;
+                            let new_upper = entry.join(&upper);
+                            if &new_upper != entry {
+                                let new_lower = entry.clone();
+                                entry.clone_from(&new_upper);
+                                updates.retain(|(time, _data, _diff)| new_lower.less_equal(time));
                                 return Box::pin(async move {
-                                    Ok(Some(ComputeResponse::PeekResponse(uuid, response)))
+                                    Ok(Response::Ready(ComputeResponse::TailResponse(
+                                        id,
+                                        TailResponse::Batch(TailBatch {
+                                            lower: new_lower,
+                                            upper: new_upper,
+                                            updates,
+                                        }),
+                                    )))
                                 });
                             }
                         }
-                        Ok(Some(ComputeResponse::FrontierUppers(mut list))) => {
-                            for (id, changes) in list.iter_mut() {
-                                if let Some((frontier, frontiers)) = self.uppers.get_mut(id) {
-                                    // Apply changes to replica `replica_id`
-                                    frontiers
-                                        .get_mut(&replica_id)
-                                        .unwrap()
-                                        .update_iter(changes.drain());
-                                    // We can swap `frontier` into `changes, negated, and then use that to repopulate `frontier`.
-                                    // Working
-                                    changes.extend(frontier.iter().map(|t| (t.clone(), -1)));
-                                    frontier.clear();
-                                    for (time1, _neg_one) in changes.iter() {
-                                        for time2 in frontiers[&replica_id].frontier().iter() {
-                                            frontier.insert(time1.join(time2));
-                                        }
-                                    }
-                                    changes.extend(frontier.iter().map(|t| (t.clone(), 1)));
-                                    changes.compact();
-                                }
-                            }
-                            if !list.is_empty() {
-                                return Box::pin(async move {
-                                    Ok(Some(ComputeResponse::FrontierUppers(list)))
-                                });
-                            }
-                        }
-                        Ok(Some(ComputeResponse::TailResponse(id, response))) => {
-                            use crate::{TailBatch, TailResponse};
-                            match response {
-                                TailResponse::Batch(TailBatch {
-                                    lower: _,
-                                    upper,
-                                    mut updates,
-                                }) => {
-                                    // It is sufficient to compare `upper` against the last reported frontier for `id`,
-                                    // and if `upper` is not less or equal to that frontier, some progress has happened.
-                                    // If so, we retain only the updates greater or equal to that last reported frontier,
-                                    // and announce a batch from that frontier to its join with `upper`.
-
-                                    // Ensure that we have a recorded frontier ready to go.
-                                    let entry = self
-                                        .tails
-                                        .entry(id)
-                                        .or_insert_with(|| Antichain::from_elem(T::minimum()));
-                                    // If the upper frontier has changed, we have a statement to make.
-                                    // This happens if there is any element of `entry` not greater or
-                                    // equal to some element of `upper`.
-                                    use differential_dataflow::lattice::Lattice;
-                                    let new_upper = entry.join(&upper);
-                                    if &new_upper != entry {
-                                        let new_lower = entry.clone();
-                                        entry.clone_from(&new_upper);
-                                        updates.retain(|(time, _data, _diff)| {
-                                            new_lower.less_equal(time)
-                                        });
-                                        return Box::pin(async move {
-                                            Ok(Some(ComputeResponse::TailResponse(
-                                                id,
-                                                TailResponse::Batch(TailBatch {
-                                                    lower: new_lower,
-                                                    upper: new_upper,
-                                                    updates,
-                                                }),
-                                            )))
-                                        });
-                                    }
-                                }
-                                TailResponse::DroppedAt(frontier) => {
-                                    // Introduce a new terminal frontier to suppress all future responses.
-                                    // We cannot simply remove the entry, as we currently create new entries in response
-                                    // to observed responses; if we pre-load the entries in response to commands we can
-                                    // clean up the state here.
-                                    self.tails.insert(id, Antichain::new());
-                                    return Box::pin(async move {
-                                        Ok(Some(ComputeResponse::TailResponse(
-                                            id,
-                                            TailResponse::DroppedAt(frontier),
-                                        )))
-                                    });
-                                }
-                            }
-                        }
-                        Ok(None) => return Box::pin(async { Ok(None) }),
-                        Err(_error) => {
-                            errored_replica = Some(replica_id);
-                            break;
+                        TailResponse::DroppedAt(frontier) => {
+                            // Introduce a new terminal frontier to suppress all future responses.
+                            // We cannot simply remove the entry, as we currently create new entries in response
+                            // to observed responses; if we pre-load the entries in response to commands we can
+                            // clean up the state here.
+                            self.tails.insert(id, Antichain::new());
+                            return Box::pin(async move {
+                                Ok(Response::Ready(ComputeResponse::TailResponse(
+                                    id,
+                                    TailResponse::DroppedAt(frontier),
+                                )))
+                            });
                         }
                     }
                 }
-                drop(stream);
-
-                if let Some(replica_id) = &errored_replica {
+                Ok(Response::RecvAgain) => (),
+                Ok(Response::Done) => return Box::pin(async { Ok(Response::Done) }),
+                Err(_error) => {
                     tracing::warn!("Rehydrating replica {:?}", replica_id);
-                    self.hydrate_replica(replica_id).await;
+                    return Box::pin(async {
+                        self.hydrate_replica(replica_id).await;
+                        Ok(Response::RecvAgain)
+                    });
                 }
-
-                clean_recv = errored_replica.is_none();
             }
-            // Indicate completion of the communication.
-            Box::pin(async { Ok(None) })
         }
     }
 }

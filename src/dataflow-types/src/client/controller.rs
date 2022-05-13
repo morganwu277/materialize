@@ -23,26 +23,22 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroUsize;
-use std::pin::Pin;
-use std::future::Future;
 
 use derivative::Derivative;
 use differential_dataflow::lattice::Lattice;
-use futures::StreamExt;
+use futures::future::{self, FutureExt};
 use maplit::hashmap;
 use serde::{Deserialize, Serialize};
 use timely::progress::frontier::{Antichain, AntichainRef};
 use timely::progress::Timestamp;
-use tokio_stream::StreamMap;
 
 use mz_orchestrator::{CpuLimit, MemoryLimit, Orchestrator, ServiceConfig, ServicePort};
 use mz_persist_types::Codec64;
 
-use crate::client::GenericClient;
 use crate::client::{
     ComputeClient, ComputeCommand, ComputeInstanceId, ComputeResponse,
     ConcreteComputeInstanceReplicaConfig, ControllerResponse, RemoteClient, ReplicaId,
-    StorageResponse,
+    StorageResponse, Recv, GenericClient, Response,
 };
 use crate::logging::LoggingConfig;
 use crate::{TailBatch, TailResponse};
@@ -370,88 +366,90 @@ impl<T> Controller<T>
 where
     T: Timestamp + Lattice + Codec64,
 {
-    pub async fn recv(&mut self) -> Pin<Box<dyn Future<Output = Result<Option<ControllerResponse<T>>, anyhow::Error>> + Send + '_>> {
-        loop {
-            let mut compute_stream: StreamMap<_, _> = self
-                .compute
-                .iter_mut()
-                .map(|(id, compute)| (*id, compute.client.as_stream()))
-                .collect();
-            tokio::select! {
-                Some((instance, response)) = compute_stream.next() => {
-                    drop(compute_stream);
-                    return Box::pin(async move {
-                        match response.await? {
-                            Some(ComputeResponse::FrontierUppers(updates)) => {
-                                self.compute_mut(instance)
-                                    // TODO: determine if this is an error, or perhaps just a late
-                                    // response about a terminated instance.
-                                    .expect("Reference to absent instance")
-                                    .update_write_frontiers(&updates)
-                                    .await?;
-                                Ok(Some(ControllerResponse::RecvAgain))
-                            }
-                            Some(ComputeResponse::PeekResponse(uuid, response)) => {
-                                self.compute_mut(instance)
-                                    .expect("Reference to absent instance")
-                                    .remove_peeks(std::iter::once(uuid))
-                                    .await?;
-                                Ok(Some(ControllerResponse::PeekResponse(uuid, response)))
-                            }
-                            Some(ComputeResponse::TailResponse(global_id, response)) => {
-                                let mut changes = timely::progress::ChangeBatch::new();
-                                match &response {
-                                    TailResponse::Batch(TailBatch { lower, upper, .. }) => {
-                                        changes.extend(upper.iter().map(|time| (time.clone(), 1)));
-                                        changes.extend(lower.iter().map(|time| (time.clone(), -1)));
-                                    }
-                                    TailResponse::DroppedAt(frontier) => {
-                                        // The tail will not be written to again, but we should not confuse that
-                                        // with the source of the TAIL being complete through this time.
-                                        changes.extend(frontier.iter().map(|time| (time.clone(), -1)));
-                                    }
-                                }
-                                self.compute_mut(instance)
-                                    .expect("Reference to absent instance")
-                                    .update_write_frontiers(&[(global_id, changes)])
-                                    .await?;
-                                Ok(Some(ControllerResponse::TailResponse(global_id, response)))
-                            }
-                            None => Ok(None),
-                        }
-                    });
-                }
-                response = self.storage_controller.recv(), if self.storage_alive => {
-                    drop(compute_stream);
-                    return Box::pin(async move {
-                        match response.await? {
-                            Some(StorageResponse::TimestampBindings(feedback)) => {
-                                // Order is important here. We must durably record
-                                // the timestamp bindings before we act on them, or
-                                // an ill-timed crash could cause data loss.
-                                self.storage_controller
-                                    .persist_timestamp_bindings(&feedback)
-                                    .await?;
+    pub async fn recv(
+        &mut self,
+    ) -> Recv<'_, ControllerResponse<T>> {
+        // loop {
+        //     let recvs = self
+        //         .compute
+        //         .iter_mut()
+        //         .map(|(id, compute)| compute.client.recv().map(|res| (*id, res)));
+        //     tokio::select! {
+        //         ((instance, response), _, futs) = future::select_all(recvs) => {
+        //             return Box::pin(async move {
+        //                 match response.await? {
+        //                     Response::Ready(ComputeResponse::FrontierUppers(updates)) => {
+        //                         self.compute_mut(instance)
+        //                             // TODO: determine if this is an error, or perhaps just a late
+        //                             // response about a terminated instance.
+        //                             .expect("Reference to absent instance")
+        //                             .update_write_frontiers(&updates)
+        //                             .await?;
+        //                         Ok(Response::Ready(ControllerResponse::RecvAgain))
+        //                     }
+        //                     Response::Ready(ComputeResponse::PeekResponse(uuid, response)) => {
+        //                         self.compute_mut(instance)
+        //                             .expect("Reference to absent instance")
+        //                             .remove_peeks(std::iter::once(uuid))
+        //                             .await?;
+        //                         Ok(Response::Ready(ControllerResponse::PeekResponse(uuid, response)))
+        //                     }
+        //                     Response::Ready(ComputeResponse::TailResponse(global_id, response)) => {
+        //                         let mut changes = timely::progress::ChangeBatch::new();
+        //                         match &response {
+        //                             TailResponse::Batch(TailBatch { lower, upper, .. }) => {
+        //                                 changes.extend(upper.iter().map(|time| (time.clone(), 1)));
+        //                                 changes.extend(lower.iter().map(|time| (time.clone(), -1)));
+        //                             }
+        //                             TailResponse::DroppedAt(frontier) => {
+        //                                 // The tail will not be written to again, but we should not confuse that
+        //                                 // with the source of the TAIL being complete through this time.
+        //                                 changes.extend(frontier.iter().map(|time| (time.clone(), -1)));
+        //                             }
+        //                         }
+        //                         self.compute_mut(instance)
+        //                             .expect("Reference to absent instance")
+        //                             .update_write_frontiers(&[(global_id, changes)])
+        //                             .await?;
+        //                         Ok(Response::Ready(ControllerResponse::TailResponse(global_id, response)))
+        //                     }
+        //                     Response::RecvAgain => Ok(Response::RecvAgain),
+        //                     Response::Done => Ok(Response::Done),
+        //                 }
+        //             });
+        //         }
+        //         response = self.storage_controller.recv(), if self.storage_alive => {
+        //             return Box::pin(async move {
+        //                 match response.await? {
+        //                     Response::Ready(StorageResponse::TimestampBindings(feedback)) => {
+        //                         // Order is important here. We must durably record
+        //                         // the timestamp bindings before we act on them, or
+        //                         // an ill-timed crash could cause data loss.
+        //                         self.storage_controller
+        //                             .persist_timestamp_bindings(&feedback)
+        //                             .await?;
 
-                                self.storage_controller
-                                    .update_write_frontiers(&feedback.changes)
-                                    .await?;
+        //                         self.storage_controller
+        //                             .update_write_frontiers(&feedback.changes)
+        //                             .await?;
 
-                                Ok(Some(ControllerResponse::RecvAgain))
-                            }
-                            Some(StorageResponse::LinearizedTimestamps(res)) => {
-                                Ok(Some(ControllerResponse::LinearizedTimestamps(res)))
-                            }
-                            None => {
-                                self.storage_alive = false;
-                                Ok(Some(ControllerResponse::RecvAgain))
-                            }
-                        }
-                    });
-                }
-                else => return Box::pin(async { Ok(None) }),
-            }
-        }
+        //                         Ok(Response::Ready(ControllerResponse::RecvAgain))
+        //                     }
+        //                     Response::Ready(StorageResponse::LinearizedTimestamps(res)) => {
+        //                         Ok(Response::Ready(ControllerResponse::LinearizedTimestamps(res)))
+        //                     }
+        //                     Response::RecvAgain => Ok(Response::RecvAgain),
+        //                     Response::Done => {
+        //                         self.storage_alive = false;
+        //                         Ok(Response::Ready(ControllerResponse::RecvAgain))
+        //                     }
+        //                 }
+        //             });
+        //         }
+        //         else => return Box::pin(async { Ok(Response::Done) }),
+        //     }
+        // }
+        todo!()
     }
 }
 

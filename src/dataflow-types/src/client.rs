@@ -437,6 +437,17 @@ pub struct TimestampBindingFeedback<T = mz_repr::Timestamp> {
     pub bindings: Vec<(GlobalId, Vec<(PartitionId, T, MzOffset)>)>,
 }
 
+/// A response from a [`GenericClient`].
+#[derive(Debug)]
+pub enum Response<R> {
+    /// A response is ready.
+    Ready(R),
+    /// A response is not yet ready. Call `recv` again.
+    RecvAgain,
+    /// The client has completed.
+    Done,
+}
+
 /// Responses that the controller can provide back to the coordinator.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ControllerResponse<T = mz_repr::Timestamp> {
@@ -475,6 +486,9 @@ pub enum StorageResponse<T = mz_repr::Timestamp> {
     LinearizedTimestamps(LinearizedTimestampBindingFeedback<T>),
 }
 
+/// The return value of [`GenericClient::recv`].
+pub type Recv<'a, R> = Pin<Box<dyn Future<Output = Result<Response<R>, anyhow::Error>> + Send + 'a>>;
+
 /// A client to a running dataflow server.
 #[async_trait]
 pub trait GenericClient<C, R>: fmt::Debug + Send {
@@ -483,30 +497,14 @@ pub trait GenericClient<C, R>: fmt::Debug + Send {
     /// The command can error for various reasons.
     async fn send(&mut self, cmd: C) -> Result<(), anyhow::Error>;
 
-    /// Receives the next response from the dataflow server.
+    /// Receives a response from the dataflow server.
     ///
-    /// This method blocks until the next response is available, or, if the
-    /// dataflow server has been shut down, returns `None`.
-    async fn recv(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<R>, anyhow::Error>> + Send>>;
-
-    /// Returns an adapter that treats the client as a stream.
-    ///
-    /// The stream produces the responses that would be produced by repeated
-    /// calls to `recv`.
-    fn as_stream<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Stream<Item = Pin<Box<dyn Future<Output = Result<Option<R>, anyhow::Error>> + Send>>> + Send + 'a>>
-    where
-        R: Send + 'a,
-    {
-        Box::pin(async_stream::stream! {
-            loop {
-                yield self.recv().await;
-            }
-        })
-    }
+    /// This method has subtle cancellation properties. The outer future is
+    /// cancellation safe and can be used in [`tokio::select!`], etc. The outer
+    /// future resolve to an inner future that, if obtained, **must** be polled
+    /// to completion. The inner future will resolves to the actual
+    /// [`Response`] from the dataflow server.
+    async fn recv(&mut self) -> Recv<R>;
 }
 
 /// A client to a storage server.
@@ -533,9 +531,7 @@ where
     async fn send(&mut self, cmd: C) -> Result<(), anyhow::Error> {
         (**self).send(cmd).await
     }
-    async fn recv(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<R>, anyhow::Error>> + Send>> {
+    async fn recv(&mut self) -> Recv<R> {
         (**self).recv().await
     }
 }
@@ -545,10 +541,7 @@ impl<T: Send> GenericClient<ComputeCommand<T>, ComputeResponse<T>> for Box<dyn C
     async fn send(&mut self, cmd: ComputeCommand<T>) -> Result<(), anyhow::Error> {
         (**self).send(cmd).await
     }
-    async fn recv(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<ComputeResponse<T>>, anyhow::Error>> + Send>>
-    {
+    async fn recv(&mut self) -> Recv<ComputeResponse<T>> {
         (**self).recv().await
     }
 }
@@ -558,10 +551,7 @@ impl<T: Send> GenericClient<StorageCommand<T>, StorageResponse<T>> for Box<dyn S
     async fn send(&mut self, cmd: StorageCommand<T>) -> Result<(), anyhow::Error> {
         (**self).send(cmd).await
     }
-    async fn recv(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<StorageResponse<T>>, anyhow::Error>> + Send>>
-    {
+    async fn recv(&mut self) -> Recv<StorageResponse<T>> {
         (**self).recv().await
     }
 }
@@ -612,9 +602,7 @@ where
         trace!("SEND dataflow command: {:?}", cmd);
         self.client.send(cmd).await
     }
-    async fn recv(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<R>, anyhow::Error>> + Send>> {
+    async fn recv(&mut self) -> Recv<R> {
         let response = self.client.recv().await.await;
         trace!("RECV dataflow response: {:?}", response);
         Box::pin(async move { response })
@@ -675,9 +663,7 @@ where
         trace!("Sending dataflow command: {:?}", cmd);
         self.client.send(cmd).await
     }
-    async fn recv(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<R>, anyhow::Error>> + Send>> {
+    async fn recv(&mut self) -> Recv<R> {
         let response = self.client.recv().await.await;
         trace!("Receiving dataflow response: {:?}", response);
         Box::pin(async move { response })
@@ -687,12 +673,10 @@ where
 /// A client backed by a process-local timely worker thread.
 pub mod process_local {
     use std::fmt;
-    use std::future::Future;
-    use std::pin::Pin;
 
     use async_trait::async_trait;
 
-    use super::GenericClient;
+    use super::{GenericClient, Recv, Response};
 
     /// A client to a dataflow server running in the current process.
     #[derive(Debug)]
@@ -716,10 +700,11 @@ pub mod process_local {
             Ok(())
         }
 
-        async fn recv(
-            &mut self,
-        ) -> Pin<Box<dyn Future<Output = Result<Option<R>, anyhow::Error>> + Send>> {
-            let res = self.feedback_rx.recv().await;
+        async fn recv(&mut self) -> Recv<R> {
+            let res = match self.feedback_rx.recv().await {
+                Some(res) => Response::Ready(res),
+                None => Response::Done,
+            };
             Box::pin(async move { Ok(res) })
         }
     }
@@ -771,7 +756,7 @@ pub mod tcp {
     use tokio_util::codec::LengthDelimitedCodec;
     use tracing::error;
 
-    use crate::client::GenericClient;
+    use crate::client::{GenericClient, Recv, Response};
 
     enum TcpConn<C, R> {
         Disconnected,
@@ -872,12 +857,10 @@ pub mod tcp {
             }
         }
 
-        async fn recv(
-            &mut self,
-        ) -> Pin<Box<dyn Future<Output = Result<Option<R>, anyhow::Error>> + Send>> {
+        async fn recv(&mut self) -> Recv<R> {
             if let TcpConn::Connected(connection) = &mut self.connection {
                 match connection.next().await {
-                    Some(Ok(response)) => Box::pin(async move { Ok(Some(response)) }),
+                    Some(Ok(response)) => Box::pin(async move { Ok(Response::Ready(response)) }),
                     other => {
                         match other {
                             Some(Ok(_)) => unreachable!("handled above"),

@@ -12,15 +12,12 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::future::Future;
 use std::iter;
-use std::pin::Pin;
 
 use async_trait::async_trait;
 use differential_dataflow::Hashable;
-use futures::StreamExt;
+use futures::future;
 use timely::progress::frontier::MutableAntichain;
-use tokio_stream::StreamMap;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -28,7 +25,8 @@ use mz_ore::cast::CastFrom;
 use mz_repr::{Diff, GlobalId, Row};
 
 use crate::client::{
-    ComputeCommand, ComputeResponse, GenericClient, PeekResponse, StorageCommand, StorageResponse,
+    ComputeCommand, ComputeResponse, GenericClient, PeekResponse, Recv, Response, StorageCommand,
+    StorageResponse,
 };
 use crate::{DataflowDescription, TailResponse};
 
@@ -81,37 +79,29 @@ where
         Ok(())
     }
 
-    async fn recv(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<R>, anyhow::Error>> + Send>> {
-        let parts = self.parts.len();
-        let mut stream: StreamMap<_, _> = self
-            .parts
-            .iter_mut()
-            .map(|shard| shard.as_stream())
-            .enumerate()
-            .collect();
-        while let Some((index, response)) = stream.next().await {
+    async fn recv(&mut self) -> Recv<R> {
+        loop {
+            let recvs = self.parts.iter_mut().map(|shard| shard.recv());
+            let (response, index, _) = future::select_all(recvs).await;
             match response.await {
                 Err(e) => {
                     // Only emit one out of every `parts` errors. (If one
                     // underlying client observes an error, we expect all of
                     // the other clients to observe the same error.)
                     self.seen_errors += 1;
-                    if (self.seen_errors % parts) == 0 {
+                    if (self.seen_errors % self.parts.len()) == 0 {
                         return Box::pin(async move { Err(e) });
                     }
                 }
-                Ok(Some(response)) => {
+                Ok(Response::Ready(response)) => {
                     if let Some(response) = self.state.absorb_response(index, response) {
-                        return Box::pin(async move { response.map(Some) });
+                        return Box::pin(async move { response.map(Response::Ready) });
                     }
                 }
-                Ok(None) => return Box::pin(async { Ok(None) }),
+                Ok(Response::Done) => return Box::pin(async { Ok(Response::Done) }),
+                Ok(Response::RecvAgain) => (),
             }
         }
-        // Indicate completion of the communication.
-        Box::pin(async { Ok(None) })
     }
 }
 

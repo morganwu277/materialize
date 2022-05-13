@@ -23,9 +23,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::fmt::Debug;
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::Pin;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -50,7 +48,7 @@ use mz_stash::{self, Stash, StashError};
 use crate::client::controller::ReadPolicy;
 use crate::client::{
     CreateSourceCommand, MzOffset, StorageClient, StorageCommand, StorageResponse,
-    TimestampBindingFeedback,
+    TimestampBindingFeedback, Recv,
 };
 use crate::sources::SourceDesc;
 use crate::Update;
@@ -145,12 +143,7 @@ pub trait StorageController: Debug + Send {
 
     async fn recv(
         &mut self,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<Option<StorageResponse<Self::Timestamp>>, anyhow::Error>>
-                + Send,
-        >,
-    >;
+    ) -> Recv<StorageResponse<Self::Timestamp>>;
 }
 
 /// Metadata required by a storage instance to read a storage collection
@@ -689,12 +682,7 @@ where
 
     async fn recv(
         &mut self,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<Option<StorageResponse<Self::Timestamp>>, anyhow::Error>>
-                + Send,
-        >,
-    > {
+    ) -> Recv<StorageResponse<Self::Timestamp>> {
         self.state.client.recv().await
     }
 

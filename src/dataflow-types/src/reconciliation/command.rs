@@ -27,8 +27,6 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::future::Future;
-use std::pin::Pin;
 
 use async_trait::async_trait;
 use timely::progress::frontier::MutableAntichain;
@@ -38,7 +36,9 @@ use tracing::warn;
 use mz_repr::GlobalId;
 
 use crate::client::controller::storage::CollectionMetadata;
-use crate::client::{ComputeClient, ComputeCommand, ComputeResponse, GenericClient};
+use crate::client::{
+    ComputeClient, ComputeCommand, ComputeResponse, GenericClient, Recv, Response,
+};
 use crate::{DataflowDescription, Plan};
 
 /// Reconcile commands targeted at a COMPUTE instance.
@@ -71,19 +71,21 @@ where
         self.absorb_command(cmd).await
     }
 
-    async fn recv(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<ComputeResponse<T>>, anyhow::Error>> + Send>>
-    {
+    async fn recv(&mut self) -> Recv<ComputeResponse<T>> {
         if let Some(response) = self.responses.pop_front() {
-            Box::pin(async move { Ok(Some(response)) })
+            Box::pin(async move { Ok(Response::Ready(response)) })
         } else {
             let response = self.client.recv().await.await;
-            if let Ok(Some(response)) = response {
+            if let Ok(Response::Ready(response)) = response {
                 self.absorb_response(response);
             }
             let response = self.responses.pop_front();
-            Box::pin(async { Ok(response) })
+            Box::pin(async {
+                match response {
+                    Some(response) => Ok(Response::Ready(response)),
+                    None => Ok(Response::Done),
+                }
+            })
         }
     }
 }

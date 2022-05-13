@@ -115,9 +115,9 @@ pub use boundary_hook::BoundaryHook;
 mod boundary_hook {
     use std::collections::BTreeMap;
     use std::fmt;
+    use std::future::Future;
     use std::iter::once;
     use std::pin::Pin;
-    use std::future::Future;
 
     use async_trait::async_trait;
 
@@ -210,7 +210,10 @@ mod boundary_hook {
             }
             Ok(())
         }
-        async fn recv(&mut self) -> Pin<Box<dyn Future<Output = Result<Option<StorageResponse<T>>, anyhow::Error>> + Send>> {
+        async fn recv(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<StorageResponse<T>>, anyhow::Error>> + Send>>
+        {
             // The receive logic draws from either the responses of the client, or requests for source instantiation.
             loop {
                 tokio::select! {
