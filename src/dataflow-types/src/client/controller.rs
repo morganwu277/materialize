@@ -46,7 +46,7 @@ use crate::{TailBatch, TailResponse};
 
 pub use storage::{StorageController, StorageControllerState};
 pub mod storage;
-pub use compute::{ComputeController, ComputeControllerMut};
+pub use compute::{ComputeController, ComputeControllerMut, ComputeControllerState};
 mod compute;
 
 /// Configures an orchestrator for the controller.
@@ -147,7 +147,7 @@ fn generate_replica_service_name(instance_id: ComputeInstanceId, replica_id: Rep
 pub struct Controller<T = mz_repr::Timestamp> {
     orchestrator: OrchestratorConfig,
     storage_controller: Box<dyn StorageController<Timestamp = T>>,
-    compute: BTreeMap<ComputeInstanceId, compute::ComputeControllerState<T>>,
+    compute: BTreeMap<ComputeInstanceId, ComputeControllerState<T>>,
     storage_alive: bool,
 }
 
@@ -163,7 +163,7 @@ where
         // Insert a new compute instance controller.
         self.compute.insert(
             instance,
-            compute::ComputeControllerState::new(&logging).await?,
+            ComputeControllerState::new(&logging).await?,
         );
 
         Ok(())
@@ -394,42 +394,42 @@ where
                 None => return Ok(Response::Done),
                 Some(Res::Compute(instance, response)) => {
                     match response.await? {
-                        // Response::Ready(ComputeResponse::FrontierUppers(updates)) => {
-                        //     self.compute_mut(instance)
-                        //         // TODO: determine if this is an error, or perhaps just a late
-                        //         // response about a terminated instance.
-                        //         .expect("Reference to absent instance")
-                        //         .update_write_frontiers(&updates)
-                        //         .await?;
-                        //     Ok(Response::Ready(ControllerResponse::RecvAgain))
-                        // }
-                        // Response::Ready(ComputeResponse::PeekResponse(uuid, response)) => {
-                        //     self.compute_mut(instance)
-                        //         .expect("Reference to absent instance")
-                        //         .remove_peeks(std::iter::once(uuid))
-                        //         .await?;
-                        //     Ok(Response::Ready(ControllerResponse::PeekResponse(uuid, response)))
-                        // }
-                        // Response::Ready(ComputeResponse::TailResponse(global_id, response)) => {
-                        //     let mut changes = timely::progress::ChangeBatch::new();
-                        //     match &response {
-                        //         TailResponse::Batch(TailBatch { lower, upper, .. }) => {
-                        //             changes.extend(upper.iter().map(|time| (time.clone(), 1)));
-                        //             changes.extend(lower.iter().map(|time| (time.clone(), -1)));
-                        //         }
-                        //         TailResponse::DroppedAt(frontier) => {
-                        //             // The tail will not be written to again, but we should not confuse that
-                        //             // with the source of the TAIL being complete through this time.
-                        //             changes.extend(frontier.iter().map(|time| (time.clone(), -1)));
-                        //         }
-                        //     }
-                        //     self.compute_mut(instance)
-                        //         .expect("Reference to absent instance")
-                        //         .update_write_frontiers(&[(global_id, changes)])
-                        //         .await?;
-                        //     Ok(Response::Ready(ControllerResponse::TailResponse(global_id, response)))
-                        // }
-                        _ => Ok(Response::RecvAgain),
+                        Response::Ready(ComputeResponse::FrontierUppers(updates)) => {
+                            self.compute_mut(instance)
+                                // TODO: determine if this is an error, or perhaps just a late
+                                // response about a terminated instance.
+                                .expect("Reference to absent instance")
+                                .update_write_frontiers(&updates)
+                                .await?;
+                            Ok(Response::Ready(ControllerResponse::RecvAgain))
+                        }
+                        Response::Ready(ComputeResponse::PeekResponse(uuid, response)) => {
+                            self.compute_mut(instance)
+                                .expect("Reference to absent instance")
+                                .remove_peeks(std::iter::once(uuid))
+                                .await?;
+                            Ok(Response::Ready(ControllerResponse::PeekResponse(uuid, response)))
+                        }
+                        Response::Ready(ComputeResponse::TailResponse(global_id, response)) => {
+                            let mut changes = timely::progress::ChangeBatch::new();
+                            match &response {
+                                TailResponse::Batch(TailBatch { lower, upper, .. }) => {
+                                    changes.extend(upper.iter().map(|time| (time.clone(), 1)));
+                                    changes.extend(lower.iter().map(|time| (time.clone(), -1)));
+                                }
+                                TailResponse::DroppedAt(frontier) => {
+                                    // The tail will not be written to again, but we should not confuse that
+                                    // with the source of the TAIL being complete through this time.
+                                    changes.extend(frontier.iter().map(|time| (time.clone(), -1)));
+                                }
+                            }
+                            self.compute_mut(instance)
+                                .expect("Reference to absent instance")
+                                .update_write_frontiers(&[(global_id, changes)])
+                                .await?;
+                            Ok(Response::Ready(ControllerResponse::TailResponse(global_id, response)))
+                        }
+                        Response::RecvAgain => Ok(Response::RecvAgain),
                         Response::Done => Ok(Response::Done),
                     }
                 }
